@@ -277,13 +277,11 @@ print_failed_logins() {
 }
 
 print_top_processes() {
-    echo
     (ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 1 && ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 4 | tail -n 3) | sed 's/^/  TOP  | /'
     echo
 }
 
 print_top_mem_processes() {
-    echo
     (ps -eo pid,%mem,comm --sort=-%mem | head -n 1 && ps -eo pid,%mem,comm --sort=-%mem | head -n 4 | tail -n 3) | sed 's/^/  TOP M| /'
     echo
 }
@@ -295,7 +293,6 @@ print_docker_info() {
         docker_output=$(docker ps --format "{{.Names}} ({{.Image}}) {{.Status}}" 2>/dev/null)
 
         if [ -n "$docker_output" ]; then
-            echo # Add a blank line before the block for separation
             # Pipe the output through tr to remove carriage returns and then sed to add the prefix
             echo "$docker_output" | tr -d '\r' | sed 's/^/  DCKR | /'
             echo
