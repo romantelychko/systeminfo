@@ -290,8 +290,14 @@ print_top_mem_processes() {
 
 print_docker_info() {
     if command_exists docker && docker info &>/dev/null 2>&1; then
-        if [ -n "$(docker ps -q)" ]; then
-            docker ps --format "  DCKR | {{.Names}} ({{.Image}}) {{.Status}}"
+        # Capture the output of docker ps to check if it's empty
+        local docker_output
+        docker_output=$(docker ps --format "{{.Names}} ({{.Image}}) {{.Status}}" 2>/dev/null)
+
+        if [ -n "$docker_output" ]; then
+            echo # Add a blank line before the block for separation
+            # Pipe the output through tr to remove carriage returns and then sed to add the prefix
+            echo "$docker_output" | tr -d '\r' | sed 's/^/  DCKR | /'
             echo
         fi
     fi
@@ -344,7 +350,7 @@ main() {
     if [[ "$BLOCKS_TO_SHOW" =~ "topm" ]]; then (print_top_mem_processes > "$TMP_DIR/topm.out") & fi
     if [[ "$BLOCKS_TO_SHOW" =~ "dckr" ]]; then (print_docker_info > "$TMP_DIR/dckr.out") & fi
     if [[ "$BLOCKS_TO_SHOW" =~ "updt" ]]; then (print_updates_info > "$TMP_DIR/updt.out") & fi
-    
+
     # Wait for all background processes to finish
     wait
 
@@ -358,6 +364,4 @@ main() {
 }
 
 # --- Script Start ---
-main
-
-
+main "$@"
