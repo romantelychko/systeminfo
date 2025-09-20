@@ -1,0 +1,363 @@
+#!/bin/bash
+
+####################################################################################################
+#
+# Author:       romantelychko
+# Repository:   https://github.com/romantelychko/systeminfo
+# Version:      2025-09-20
+#
+# Description:
+# This script provides a concise overview of key system information, designed to be run upon
+# SSH login. It uses parallel execution for "slow" modules (like network lookups) to ensure
+# it runs as fast as possible.
+#
+# Usage:
+#   systeminfo               (Displays the default, fast set of information blocks)
+#   systeminfo -key1,key2    (Displays only the specified blocks)
+#
+# Available Block Keys:
+#   - Fast (Default):
+#     date, cpu, gpu, mem, sys, up, df, net, pubip, traf, users, top, dckr
+#
+#   - Slow (Optional):
+#     io, ports, updt, fails, topm
+#
+# Example: To see default blocks plus I/O stats and open ports:
+#   systeminfo -io,ports
+#
+####################################################################################################
+
+# --- Environment Setup ---
+export LC_ALL=C
+IFS=$'\n'
+
+# --- Argument Parsing ---
+# A complete list of all available block keys
+ALL_BLOCKS="date cpu mem sys up df net pubip traf users fails top dckr io ports updt topm gpu"
+# Blocks displayed by default (only the fast ones)
+DEFAULT_BLOCKS="date cpu gpu mem sys up df net pubip traf users top dckr"
+BLOCKS_TO_SHOW=""
+
+if [ -z "$1" ]; then
+    # Default to the standard set of blocks
+    BLOCKS_TO_SHOW="$DEFAULT_BLOCKS"
+else
+    # User has specified which blocks to show
+    BLOCKS_TO_SHOW=$(echo "$1" | sed 's/^-//' | tr ',' ' ')
+fi
+
+# --- Temporary Directory for Parallel Execution ---
+TMP_DIR=$(mktemp -d)
+
+# --- Helper Functions ---
+command_exists() {
+    command -v "$1" &>/dev/null
+}
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+# Ensure cleanup runs on script exit
+trap cleanup EXIT
+
+# --- Main Functions ---
+
+print_date() {
+    printf "  DATE | %s\n\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+print_cpu_info() {
+    local model cores la usage_percent
+    model=$(grep -m 1 "model name" /proc/cpuinfo | cut -d ':' -f2 | sed 's/^[ \t]*//')
+    cores=$(grep -c "^processor" /proc/cpuinfo)
+    la=$(cut -d ' ' -f1-3 /proc/loadavg)
+    
+    local prev_stats curr_stats
+    prev_stats=$(head -n 1 /proc/stat)
+    sleep 0.2
+    curr_stats=$(head -n 1 /proc/stat)
+
+    local prev_idle prev_total curr_idle curr_total
+    prev_idle=$(echo "$prev_stats" | awk '{print $5}')
+    prev_total=$(echo "$prev_stats" | awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}')
+    curr_idle=$(echo "$curr_stats" | awk '{print $5}')
+    curr_total=$(echo "$curr_stats" | awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}')
+    
+    local total_diff=$((curr_total - prev_total))
+    local idle_diff=$((curr_idle - prev_idle))
+    
+    if [ "$total_diff" -gt 0 ] && command_exists bc; then
+        usage_percent=$(printf "%.1f%%" "$(echo "100 * ($total_diff - $idle_diff) / $total_diff" | bc -l)")
+    else
+        usage_percent="N/A"
+    fi
+
+    printf "  CPU  | %s\n" "$model"
+    printf "  #CPU | %s\n" "$cores"
+    printf "  LA   | %-5s\n" "$la"
+    printf "  CPU%% | %s\n" "$usage_percent"
+}
+
+print_cpu_temp() {
+    local temp=""
+    if command_exists sensors; then
+        temp=$(sensors | grep -i -m 1 -E 'Core 0|Package id 0' | awk '{print $4}')
+    elif [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+        local temp_raw
+        temp_raw=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+        if [[ "$temp_raw" =~ ^[0-9]+$ && "$temp_raw" -ne 0 ]]; then
+            temp=$(printf "%.1f°C" "$((temp_raw / 1000))")
+        fi
+    elif command_exists vcgencmd; then # For Raspberry Pi
+        temp=$(vcgencmd measure_temp | cut -d '=' -f2)
+    fi
+    [ -n "$temp" ] && printf "  TEMP | %s\n" "$temp"
+}
+
+print_gpu_info() {
+    if command_exists nvidia-smi; then
+        nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  GPU  | %-20s %sC, %s%%\n", $1, $2, $3}'
+    fi
+}
+
+print_memory_info() {
+    awk '
+        /MemTotal:/     {tm=$2}
+        /MemAvailable:/  {am=$2}
+        /MemFree:/       {mf=$2}
+        /Buffers:/       {b=$2}
+        /Cached:/        {c=$2}
+        /SwapTotal:/     {ts=$2}
+        /SwapFree:/      {fs=$2}
+        END {
+            if (am == 0) { am = mf + b + c } # Fallback for older kernels
+            um = tm - am
+            us = ts - fs
+
+            # Format to G or M for readability
+            tm_h = tm > 1048576 ? sprintf("%.1fG", tm/1048576) : sprintf("%.0fM", tm/1024)
+            um_h = um > 1048576 ? sprintf("%.1fG", um/1048576) : sprintf("%.0fM", um/1024)
+            am_h = am > 1048576 ? sprintf("%.1fG", am/1048576) : sprintf("%.0fM", am/1024)
+            printf "  MEM  | tot %8s | used %8s | avail %8s\n", tm_h, um_h, am_h
+
+            if (ts > 0) {
+                ts_h = ts > 1048576 ? sprintf("%.1fG", ts/1048576) : sprintf("%.0fM", ts/1024)
+                us_h = us > 1048576 ? sprintf("%.1fG", us/1048576) : sprintf("%.0fM", us/1024)
+                fs_h = fs > 1048576 ? sprintf("%.1fG", fs/1048576) : sprintf("%.0fM", fs/1024)
+                printf "  SWP  | tot %8s | used %8s | free  %8s\n", ts_h, us_h, fs_h
+            }
+        }
+    ' /proc/meminfo
+    echo
+}
+
+print_system_info() {
+    local os_name
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        os_name="$PRETTY_NAME"
+    elif command_exists lsb_release; then
+        os_name=$(lsb_release -ds)
+    else
+        os_name="N/A"
+    fi
+
+    printf "  ARCH | %s\n" "$(uname -m)"
+    printf "  KERN | %s\n" "$(uname -r)"
+    printf "  OS   | %s\n" "$os_name"
+    printf "  HOST | %s\n\n" "$(hostname)"
+}
+
+print_uptime() {
+    local up_str
+    if command_exists uptime && uptime -p &>/dev/null; then
+        up_str="$(uptime -p | sed 's/up //')"
+    else
+        local up_seconds up_days up_hours up_mins
+        up_seconds=$(cut -d'.' -f1 /proc/uptime)
+        up_days=$((up_seconds / 86400)); up_hours=$(((up_seconds / 3600) % 24)); up_mins=$(((up_seconds / 60) % 60))
+        up_str="$up_days days, $up_hours hours, $up_mins minutes"
+    fi
+    printf "  UP   | %s\n\n" "$up_str"
+}
+
+print_disk_usage() {
+    df -hP | grep -vE '^Filesystem|tmpfs|udev|loop|efivarfs|devtmpfs' | sed 's/^/  DF   | /'
+    echo
+}
+
+print_io_activity() {
+    if command_exists iostat; then
+        local io_output
+        # Collect data for 1 second, 2 times to get a stable average
+        io_output=$(iostat -d 1 2 -N | awk '/Device/{p=1;next} p' | tail -n +2)
+        if [ -n "$io_output" ]; then
+            # Show only devices with activity
+            echo "$io_output" | awk '$2 > 0 || $3 > 0 {printf "  I/O  | %-12s r/s %-7s w/s %s\n", $1, $3, $4}'
+            echo
+        fi
+    fi
+}
+
+print_network_info() {
+    ip -4 -o addr show | awk '!/ lo / {printf "  NET  | %-16s %s\n", $2, $4}'
+    echo
+}
+
+print_public_ip() {
+    local pub_ip=""
+    if command_exists curl; then
+        pub_ip=$(curl -s --max-time 2 ifconfig.me)
+    elif command_exists wget; then
+        pub_ip=$(wget -qO- --timeout=2 ifconfig.me)
+    fi
+    [ -n "$pub_ip" ] && printf "  PUBIP| %s\n" "$pub_ip"
+    echo
+}
+
+print_network_traffic() {
+    awk '
+    NR > 2 && $1 !~ /lo/ {
+        sub(/:/, "", $1);
+        rx = $2; tx = $10;
+
+        # Format bytes into K, M, G
+        rx_h = rx > 1073741824 ? sprintf("%.1fG", rx/1073741824) : (rx > 1048576 ? sprintf("%.1fM", rx/1048576) : (rx > 1024 ? sprintf("%.0fK", rx/1024) : sprintf("%dB", rx)));
+        tx_h = tx > 1073741824 ? sprintf("%.1fG", tx/1073741824) : (tx > 1048576 ? sprintf("%.1fM", tx/1048576) : (tx > 1024 ? sprintf("%.0fK", tx/1024) : sprintf("%dB", tx)));
+
+        printf "  TRAF | %-16s Rx %s, Tx %s\n", $1, rx_h, tx_h;
+    }' /proc/net/dev
+    echo
+}
+
+print_listening_ports() {
+    if command_exists ss; then
+        local ports_data
+        ports_data=$(ss -tulpn | grep LISTEN)
+        if [ -n "$ports_data" ]; then
+            echo "$ports_data" | awk '{
+                split($5, a, ":");
+                port = a[length(a)];
+                gsub(/.*users:\(\("|\",.*/, "", $7);
+                proc = $7;
+                print port, proc;
+            }' | sort -un | head -n 7 | awk '{printf "  PORTS| %-7s (%s)\n", $1, $2}'
+            echo
+        fi
+    fi
+}
+
+print_users_info() {
+    local who_output
+    who_output=$(who)
+    [ -n "$who_output" ] && echo "$who_output" | sed 's/^/  WHO  | /'
+
+    if command_exists last; then
+        local last_output
+        last_output=$(last -n 3 2>/dev/null)
+        if [ -n "$last_output" ]; then
+            [ -n "$who_output" ] && echo
+            echo "$last_output" | sed 's/^/  LAST | /'
+        fi
+    fi
+}
+
+print_failed_logins() {
+    if command_exists lastb; then
+        # Needs sudo permissions, might not work for all users
+        local fails
+        fails=$(sudo lastb -a -n 3 2>/dev/null)
+        if [ -n "$fails" ]; then
+            echo
+            echo "$fails" | sed 's/^/  FAILS| /'
+        fi
+    fi
+    echo
+}
+
+print_top_processes() {
+    echo
+    (ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 1 && ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -n 4 | tail -n 3) | sed 's/^/  TOP  | /'
+    echo
+}
+
+print_top_mem_processes() {
+    echo
+    (ps -eo pid,%mem,comm --sort=-%mem | head -n 1 && ps -eo pid,%mem,comm --sort=-%mem | head -n 4 | tail -n 3) | sed 's/^/  TOP M| /'
+    echo
+}
+
+print_docker_info() {
+    if command_exists docker && docker info &>/dev/null 2>&1; then
+        if [ -n "$(docker ps -q)" ]; then
+            docker ps --format "  DCKR | {{.Names}} ({{.Image}}) {{.Status}}"
+            echo
+        fi
+    fi
+}
+
+print_updates_info() {
+    # This can be slow depending on the package manager's cache
+    if command_exists apt-get; then
+        if [ -f /usr/lib/update-notifier/apt-check ]; then
+            local updates total sec
+            updates=$(/usr/lib/update-notifier/apt-check 2>&1)
+            total=$(echo "$updates" | cut -d';' -f1)
+            sec=$(echo "$updates" | cut -d';' -f2)
+            if [ "$total" -gt 0 ]; then
+                printf "  UPDT | %s available (%s security)\n" "$total" "$sec"
+            fi
+        fi
+    elif command_exists dnf; then
+        local updates
+        updates=$(dnf list updates -q | grep -vc "Updated Packages")
+        if [ "$updates" -gt 0 ]; then printf "  UPDT | %s available\n" "$updates"; fi
+    fi
+}
+
+# --- Main Execution Logic ---
+main() {
+    clear
+
+    # --- Stage 1: Fast, local operations (run sequentially) ---
+    if [[ "$BLOCKS_TO_SHOW" =~ "date" ]]; then print_date; fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "cpu" || "$BLOCKS_TO_SHOW" =~ "gpu" ]]; then
+        if [[ "$BLOCKS_TO_SHOW" =~ "cpu" ]]; then print_cpu_info; print_cpu_temp; fi
+        if [[ "$BLOCKS_TO_SHOW" =~ "gpu" ]]; then print_gpu_info; fi
+        printf "\n"
+    fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "mem" ]]; then print_memory_info; fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "sys" ]]; then print_system_info; fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "up" ]]; then print_uptime; fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "df" ]]; then print_disk_usage; fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "traf" ]]; then print_network_traffic; fi
+
+    # --- Stage 2: Slower operations (run in parallel in the background) ---
+    if [[ "$BLOCKS_TO_SHOW" =~ "net" ]]; then (print_network_info > "$TMP_DIR/net.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "pubip" ]]; then (print_public_ip > "$TMP_DIR/pubip.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "io" ]]; then (print_io_activity > "$TMP_DIR/io.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "ports" ]]; then (print_listening_ports > "$TMP_DIR/ports.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "users" ]]; then (print_users_info > "$TMP_DIR/users.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "fails" ]]; then (print_failed_logins > "$TMP_DIR/fails.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "top" ]]; then (print_top_processes > "$TMP_DIR/top.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "topm" ]]; then (print_top_mem_processes > "$TMP_DIR/topm.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "dckr" ]]; then (print_docker_info > "$TMP_DIR/dckr.out") & fi
+    if [[ "$BLOCKS_TO_SHOW" =~ "updt" ]]; then (print_updates_info > "$TMP_DIR/updt.out") & fi
+    
+    # Wait for all background processes to finish
+    wait
+
+    # --- Stage 3: Output results from slower operations ---
+    # Print in a consistent order
+    for block in io net pubip ports users fails top topm dckr updt; do
+        if [[ "$BLOCKS_TO_SHOW" =~ $block ]] && [ -s "$TMP_DIR/$block.out" ]; then
+            cat "$TMP_DIR/$block.out"
+        fi
+    done
+}
+
+# --- Script Start ---
+main
+
+
