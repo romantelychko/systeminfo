@@ -110,7 +110,7 @@ sudo wget -O /usr/local/bin/systeminfo https://raw.githubusercontent.com/romante
 ### Auto-run on Login
 To have systeminfo run every time you log in via SSH, add it to your shell's profile file.
 ```bash
-echo -e "\nsysteminfo\n" >> ~/.bash_profile
+echo -e "\nsysteminfo\n" >> ~/.profile
 ```
 
 Note: Depending on your system, you might need to use `~/.profile` or `~/.bash_login` instead of `~/.bash_profile`.
